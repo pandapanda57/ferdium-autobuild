@@ -33,6 +33,10 @@ on:
         description: 'Build a fresh TEST release on the newest Electron major even if one exists'
         type: boolean
         default: false
+      check_only:
+        description: 'Install, test, patch and type-check the current normal build; build and publish nothing'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -57,6 +61,7 @@ jobs:
       REPO: ${{ github.repository }}
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       REBUILD_TEST: ${{ github.event.inputs.rebuild_test || 'false' }}
+      CHECK_ONLY: ${{ github.event.inputs.check_only || 'false' }}
     steps:
       - name: Work out what needs building
         id: plan
@@ -100,6 +105,14 @@ jobs:
             t=$(jq -r .tag <<<"$row")
             kind=$(jq -r .kind <<<"$row")
             major=$(jq -r '.electron | split(".")[0]' <<<"$row")
+            if [ "$CHECK_ONLY" = "true" ]; then
+              # Check-only: run the normal build's checks even if already released; never TEST builds
+              if [ "$kind" = "patch" ]; then
+                echo "Check-only (no build, no publish): $t"
+                TARGETS=$(jq -c --argjson r "$row" '. + [$r]' <<<"$TARGETS")
+              fi
+              continue
+            fi
             if [ "$kind" = "test" ] && [ "$REBUILD_TEST" != "true" ] && grep -q -- "-electron-$major\." <<<"$RELEASED"; then
               echo "TEST build for Electron $major already exists, skipping: $t"
             elif [ "$kind" = "test" ] && [ "$REBUILD_TEST" != "true" ] && grep -q -- "+ Electron $major\." <<<"$FAILED"; then
@@ -161,6 +174,7 @@ jobs:
     name: 'Ferdium ${{ matrix.ferdium }} + Electron ${{ matrix.electron }} (${{ matrix.kind }})'
     env:
       GH_TOKEN: ${{ github.token }}
+      CHECK_ONLY: ${{ github.event.inputs.check_only || 'false' }}
     steps:
       - name: Set env vars
         run: |
@@ -363,20 +377,30 @@ jobs:
       - name: Type-check against Electron ${{ matrix.electron }} (compat builds only, informational)
         if: matrix.compat
         continue-on-error: true
+        # --pretty false and colour stripping keep "error TSnnnn" greppable; if tsc fails without
+        # any TSnnnn lines, the log tail is printed so the failure is never reported as "0 errors".
         run: |
           set +e
-          pnpm typecheck > typecheck.log 2>&1
+          pnpm typecheck --pretty false > typecheck.log 2>&1
           code=$?
-          echo "TypeScript errors: $(grep -c 'error TS' typecheck.log)"
-          grep 'error TS' typecheck.log | head -60
+          sed -i -E 's/\x1b\[[0-9;]*[A-Za-z]//g' typecheck.log
+          n=$(grep -cE 'error TS[0-9]+' typecheck.log)
+          echo "tsc exit code: $code | TypeScript errors: $n"
+          echo "--- errors per file:"
+          grep -E 'error TS[0-9]+' typecheck.log | sed -E 's/\(([0-9]+),[0-9]+\): error.*//' | sort | uniq -c | sort -rn | head -40
+          echo "--- errors:"
+          grep -E 'error TS[0-9]+' typecheck.log | head -150
+          if [ "$code" -ne 0 ] && [ "$n" -eq 0 ]; then echo "--- tsc failed without TSnnnn lines; last 80 log lines:"; tail -80 typecheck.log; fi
           exit $code
         shell: bash
       - name: Build Ferdium
+        if: env.CHECK_ONLY != 'true'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
         run: pnpm build --publish never
         shell: bash
       - name: Confirm the packaged Electron version
+        if: env.CHECK_ONLY != 'true'
         shell: pwsh
         run: |
           $txt = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes('out\win-unpacked\Ferdium.exe'))
@@ -384,6 +408,7 @@ jobs:
           "Packaged Electron: $found"
           if ($found -ne '${{ matrix.electron }}') { throw "Expected Electron ${{ matrix.electron }}, found $found" }
       - name: Publish release
+        if: env.CHECK_ONLY != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -407,7 +432,7 @@ jobs:
             --target "${{ github.event.repository.default_branch }}" \
             --title "$TITLE" --notes-file notes.md $FLAGS
       - name: Open an issue for a failed TEST build
-        if: failure() && matrix.kind == 'test'
+        if: failure() && matrix.kind == 'test' && env.CHECK_ONLY != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -417,7 +442,7 @@ jobs:
           printf 'The TEST build of Ferdium %s on Electron %s failed, so no TEST release was published.\n\nElectron %s will not be TEST-built again while this issue is open. Close it to allow a retry.\n\nBuild log: %s\n' "${FERDIUM#v}" "$ELECTRON" "$MAJOR" "$RUN_URL" > issue.md
           gh issue create --repo "${{ github.repository }}" --title "$TITLE" --body-file issue.md
       - name: Open an issue for a failed normal build
-        if: failure() && matrix.kind == 'patch'
+        if: failure() && matrix.kind == 'patch' && env.CHECK_ONLY != 'true'
         shell: bash
         run: |
           set -euo pipefail
