@@ -47,7 +47,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NPM_FIX_REV: '2'
+  # Build revision: bump to rebuild the current Electron patch (r3 = in-app updates from this repo)
+  NPM_FIX_REV: '3'
   # Electron major for normal builds (user switched to 45 on 2026-11-02 after trialling Chrome 156)
   ELECTRON_LINE: '45'
 
@@ -100,6 +101,16 @@ jobs:
           RELEASED=$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')
           FAILED=$(gh issue list --repo "$REPO" --state open --limit 1000 --json title --jq '.[].title | select(startswith("TEST build failed:"))')
           PATCH_FAILED=$(gh issue list --repo "$REPO" --state open --limit 1000 --json title --jq '.[].title | select(startswith("Build failed: "))')
+          # App version per build, so Ferdium's in-app updater sees each build as newer than the last:
+          # <major>.<minor>.<patch*1000+n>, n = builds already released from this official tag + 1
+          UP=${FERDIUM_TAG#v}; UPMAJ=${UP%%.*}; REST=${UP#*.}; UPMIN=${REST%%.*}; UPPAT=${REST#*.}; UPPAT=${UPPAT%%[-+]*}
+          N=$(grep -c -- "^ferdium-$FERDIUM_TAG-" <<<"$RELEASED" || true)
+          add_target() {
+            N=$((N + 1))
+            local v="$UPMAJ.$UPMIN.$((UPPAT * 1000 + N))"
+            echo "  app version: $v"
+            TARGETS=$(jq -c --argjson r "$(jq -c --arg v "$v" '. + {appversion: $v}' <<<"$row")" '. + [$r]' <<<"$TARGETS")
+          }
           TARGETS='[]'
           for row in $(jq -c '.targets[]' plan.json); do
             t=$(jq -r .tag <<<"$row")
@@ -109,7 +120,7 @@ jobs:
               # Check-only: run the normal build's checks even if already released; never TEST builds
               if [ "$kind" = "patch" ]; then
                 echo "Check-only (no build, no publish): $t"
-                TARGETS=$(jq -c --argjson r "$row" '. + [$r]' <<<"$TARGETS")
+                add_target
               fi
               continue
             fi
@@ -123,12 +134,30 @@ jobs:
               echo "Already built: $t"
             else
               echo "To build: $t"
-              TARGETS=$(jq -c --argjson r "$row" '. + [$r]' <<<"$TARGETS")
+              add_target
             fi
           done
           echo "targets=$TARGETS" >> "$GITHUB_OUTPUT"
           echo "M=$M" >> "$GITHUB_ENV"
           echo "L=$L" >> "$GITHUB_ENV"
+
+      - name: Report new official Ferdium releases
+        # Opens one issue (GitHub emails you) when official Ferdium publishes a release that this
+        # repository's Latest build is not based on yet. The build itself follows within 6 hours.
+        shell: bash
+        run: |
+          set -euo pipefail
+          OFFICIAL=$(gh api repos/ferdium/ferdium-app/releases/latest --jq .tag_name)
+          PUB=$(gh api repos/ferdium/ferdium-app/releases/latest --jq '.published_at[:10]')
+          OURS=$(gh release list --repo "$REPO" --limit 50 --exclude-pre-releases --json tagName,isLatest --jq '[.[] | select(.isLatest)][0].tagName // ""')
+          case "$OURS" in "ferdium-$OFFICIAL-"*) echo "Latest build is based on official $OFFICIAL"; exit 0 ;; esac
+          TITLE="Official Ferdium $OFFICIAL released"
+          if [ "$(gh issue list --repo "$REPO" --state all --limit 1000 --json title --jq "[.[] | select(.title == \"$TITLE\")] | length")" = "0" ]; then
+            BASE=$(sed -E 's/^ferdium-(v[^-]+)-.*/\1/' <<<"$OURS")
+            gh issue create --repo "$REPO" --title "$TITLE" --body "Official Ferdium $OFFICIAL was published on $PUB: https://github.com/ferdium/ferdium-app/releases/tag/$OFFICIAL
+
+          Your current build is based on ${BASE:-an unknown version}. This repository builds the new version automatically within 6 hours, and it then appears in Ferdium's update banner. Close this issue once you have updated."
+          fi
 
       - name: Warn when Ferdium's Electron major is near end of support
         shell: bash
@@ -403,6 +432,25 @@ jobs:
           if [ "$code" -ne 0 ] && [ "$n" -eq 0 ]; then echo "--- tsc failed without TSnnnn lines; last 80 log lines:"; tail -80 typecheck.log; fi
           exit $code
         shell: bash
+      # In-app updates: Ferdium's updater follows this repository and compares app versions.
+      - name: Set app version and in-app update source
+        run: |
+          set -euo pipefail
+          V="${{ matrix.appversion }}"; OWNER="${GITHUB_REPOSITORY%%/*}"; REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad app version '$V'"; exit 1; }
+          npm pkg set "version=$V"
+          # Top-level publish block only (snapcraft has its own, indented)
+          sed -i -E "/^publish:\$/,/^[^ ]/ s#^  provider: github\$#  provider: github\n  owner: $OWNER\n  repo: $REPO_NAME#" electron-builder.yml
+          grep -q "^  owner: $OWNER\$" electron-builder.yml && grep -q "^  repo: $REPO_NAME\$" electron-builder.yml
+          sed -n '/^publish:/,/^$/p' electron-builder.yml
+          # Changelog links: show this repository's newest release notes instead of official
+          # Ferdium's notes for a version number that only exists here.
+          U=src/helpers/update-helpers.ts
+          sed -i -e "s#owner: 'ferdium',#owner: '$OWNER',#" -e "s#repo: 'ferdium-app',#repo: '$REPO_NAME',#" \
+                 -e "s#'GET /repos/{owner}/{repo}/releases/tags/{tag}'#'GET /repos/{owner}/{repo}/releases/latest'#" "$U"
+          grep -q "releases/latest" "$U" && grep -q "owner: '$OWNER'" "$U"
+          echo "App version $V; in-app updates from $GITHUB_REPOSITORY"
+        shell: bash
       - name: Build Ferdium
         if: env.CHECK_ONLY != 'true'
         env:
@@ -417,6 +465,19 @@ jobs:
           $found = [regex]::Matches($txt, 'Electron/(\d+\.\d+\.\d+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
           "Packaged Electron: $found"
           if ($found -ne '${{ matrix.electron }}') { throw "Expected Electron ${{ matrix.electron }}, found $found" }
+          $pv = (Get-Item 'out\win-unpacked\Ferdium.exe').VersionInfo.ProductVersion
+          "Packaged app version: $pv"
+          if (-not $pv.StartsWith('${{ matrix.appversion }}')) { throw "Expected app version ${{ matrix.appversion }}, found $pv" }
+          # The in-app updater reads latest.yml; it must name this version and an installer we upload
+          $yml = Get-Content 'out\latest.yml' -Raw
+          "latest.yml:`n$yml"
+          if ($yml -notmatch '(?m)^version: ${{ matrix.appversion }}\s*$') { throw 'latest.yml has the wrong version' }
+          $path = [regex]::Match($yml, '(?m)^path: (.+)$').Groups[1].Value.Trim()
+          if ($path -notlike 'Ferdium-win-AutoSetup-*-x64.exe' -or -not (Test-Path "out\$path")) { throw "latest.yml points to '$path'" }
+          if (-not (Test-Path "out\$path.blockmap")) { throw "missing out\$path.blockmap" }
+          $ays = Get-Content 'out\win-unpacked\resources\app-update.yml' -Raw
+          "app-update.yml:`n$ays"
+          if ($ays -notmatch '(?m)^owner: ${{ github.repository_owner }}\s*$') { throw 'app-update.yml does not point to this repository' }
       - name: Publish release
         if: env.CHECK_ONLY != 'true'
         shell: bash
@@ -436,11 +497,15 @@ jobs:
               NOTE="Official Ferdium ${FERDIUM#v} source with Electron updated to $ELECTRON (security and bug-fix patch of the same major version)."
             fi
           fi
+          APPV="${{ matrix.appversion }}"; BUILD_N=$(( ${APPV##*.} % 1000 ))
+          TITLE="$TITLE (app $APPV)"
+          NOTE="$NOTE App version $APPV = official Ferdium ${FERDIUM#v}, build $BUILD_N here; Ferdium's in-app updater (Settings > Enable updates) installs builds from this repository."
           printf '%s\n\nAlso forces security updates of shipped npm packages (override list r%s in the workflow, including tar 7; new releases must be 7 days old) and applies three hardening patches: tar 7 import, recipe unpacking without preservePaths, and a local-server token check that rejects requests before body parsing. Ferdium'"'"'s lint and tests passed on the unpatched source; the patched local server passed a real AdonisJS test (no request without the token reaches the body parser).\n\nStill open (not fixable without a newer AdonisJS): bodyparser 2.3.0, lucid 6.3.0, knex 0.21.21 and path-to-regexp 2.4.0 advisories, now reachable only with the local token; decode-uri-component CVE-2026-118664 (build tooling, no CommonJS fix); minimatch moderate advisory (fixed only in 11.x).\n\nInstall: download Ferdium-Setup-x64.exe (identical to Ferdium-win-AutoSetup-*-x64.exe) and run it. Newest build, always: https://github.com/%s/releases/latest/download/Ferdium-Setup-x64.exe The build is unsigned, so at the SmartScreen warning click More info, then Run anyway.\n\nBuilt from https://github.com/ferdium/ferdium-app/tree/%s; only the Electron version, those npm package versions and the patches listed in the workflow changed.\n' "$NOTE" "$NPM_FIX_REV" "${{ github.repository }}" "$FERDIUM" > notes.md
           # Fixed-name copy so .../releases/latest/download/Ferdium-Setup-x64.exe never breaks
           # when Ferdium's version changes.
           cp out/Ferdium-win-AutoSetup-*-x64.exe out/Ferdium-Setup-x64.exe
           gh release create "${{ matrix.tag }}" out/Ferdium-win-AutoSetup-*-x64.exe out/Ferdium-Setup-x64.exe \
+            out/latest.yml out/Ferdium-win-AutoSetup-*-x64.exe.blockmap \
             --repo "${{ github.repository }}" \
             --target "${{ github.event.repository.default_branch }}" \
             --title "$TITLE" --notes-file notes.md $FLAGS
