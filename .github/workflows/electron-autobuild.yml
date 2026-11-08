@@ -183,17 +183,19 @@ jobs:
           echo "ELECTRON_BUILDER_CACHE=$USERPROFILE/.cache/electron-builder" >> $GITHUB_ENV
         shell: bash
       - name: Checkout official Ferdium release
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ferdium/ferdium-app
           ref: ${{ matrix.ferdium }}
           submodules: recursive
       - name: Use Node.js specified in the '.nvmrc' file
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version-file: '.nvmrc'
+          # v5 auto-caches via packageManager, which would run before pnpm is installed
+          package-manager-cache: false
       - name: Install pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       # Same workaround as Ferdium's own build (electron-builder issue 6933)
       - name: Tweak pnpm.cjs
         run: |
@@ -266,7 +268,7 @@ jobs:
           sed -n '/^overrides:/,/^[^ ]/p' pnpm-workspace.yaml
         shell: bash
       - name: Install node dependencies
-        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         with:
           command: pnpm i --no-frozen-lockfile
           timeout_minutes: 15
@@ -323,7 +325,7 @@ jobs:
         shell: bash
       # This repository's patch files, at the exact commit this run uses (no separate download).
       - name: Checkout this repository's patches
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.sha }}
           path: .fork-patches
@@ -356,6 +358,14 @@ jobs:
           # 2) recipe archives may not write outside their folder
           sed -i 's/preservePaths: true,/preservePaths: false,/' "$F"
           if grep -q "preservePaths: true" "$F"; then echo "preservePaths still true"; exit 1; fi
+          # 2b) Dark Reader 4.9.120+ (forced by the overrides) requires ignoreCSSUrl in its fix object.
+          #     Runtime already defaults it; this keeps the type-check clean so real errors stand out.
+          DR=src/webview/recipe.ts
+          if grep -q "ignoreCSSUrl" node_modules/darkreader/index.d.ts 2>/dev/null && ! grep -q "ignoreCSSUrl" "$DR"; then
+            sed -i -E 's/^([[:space:]]*)disableStyleSheetsProxy: false,$/\1disableStyleSheetsProxy: false,\n\1ignoreCSSUrl: [],/' "$DR"
+            [ "$(grep -c 'ignoreCSSUrl: \[\],' "$DR")" = 1 ] || { echo "Dark Reader patch did not apply exactly once"; exit 1; }
+            echo "Patched $DR for Dark Reader's ignoreCSSUrl"
+          fi
           # 3) local server: token check before body parsing and routing
           IS=src/internal-server
           cp "$PATCHES/internal-server-RequireLocalToken.js" $IS/app/Middleware/RequireLocalToken.js
